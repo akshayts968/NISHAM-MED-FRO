@@ -324,5 +324,7 @@ def analyze_wfdb():
 
 # Start Server
 if __name__ == '__main__':
-    print("Flask Server running on http://localhost:5000")
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    # Render provides a $PORT environment variable. If it's missing, default to 5000.
+    port = int(os.environ.get("PORT", 5000))
+    print(f"Flask Server running on port {port}")
+    app.run(host='0.0.0.0', port=port)
