@@ -73,7 +73,7 @@ def login_route():
 # ==========================================
 # --------- MEDICAL HISTORY ROUTES ---------
 # ==========================================
-@app.route('/api/medical-history/<int:user_id>', methods=['GET'])
+@app.route('/api/medical-history/<string:user_id>', methods=['GET'])
 def get_medical_history(user_id):
     if db is None: return jsonify({"error": "Database unavailable"}), 503
     try:
@@ -111,7 +111,7 @@ def save_medical_history():
 # ==========================================
 # --------- LIFESTYLE DATA ROUTES ----------
 # ==========================================
-@app.route('/api/lifestyle-data/<int:user_id>', methods=['GET'])
+@app.route('/api/lifestyle-data/<string:user_id>', methods=['GET'])
 def get_lifestyle_data(user_id):
     if db is None: return jsonify({"error": "Database unavailable"}), 503
     try:
@@ -132,7 +132,6 @@ def get_lifestyle_data(user_id):
         return jsonify(None)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
 @app.route('/api/lifestyle-data', methods=['POST'])
 def save_lifestyle_data():
     if db is None: return jsonify({"error": "Database unavailable"}), 503
@@ -142,19 +141,19 @@ def save_lifestyle_data():
     try:
         update_fields = {}
         
-        # Only add text fields to the update list if they aren't empty
-        for key in ['physicalActivity', 'smoking', 'alcoholUse', 'otherSubstances']:
-            if data.get(key):
-                update_fields[key] = data.get(key)
-                
-        # Only add integer fields to the update list if they aren't empty
-        for key in ['chestDiscomfort', 'exerciseAngina']:
+        # CHANGED: Treat ALL of these as text/string fields now! No more integers.
+        all_fields = [
+            'physicalActivity', 'smoking', 'alcoholUse', 
+            'otherSubstances', 'chestDiscomfort', 'exerciseAngina'
+        ]
+        
+        for key in all_fields:
             val = data.get(key)
             if val != "" and val is not None:
-                update_fields[key] = int(val)
+                update_fields[key] = val  # We removed the int(val) conversion here
 
         if update_fields:
-            # $set acts like COALESCE automatically. It won't overwrite existing fields not sent in the update.
+            # $set won't overwrite existing fields not sent in the update
             db.lifestyle_data.update_one(
                 {"user_id": user_id},
                 {"$set": update_fields},
@@ -164,9 +163,25 @@ def save_lifestyle_data():
         return jsonify({"message": "Data saved successfully!"}), 200
         
     except Exception as e:
+        # I added this print statement so you can see exact errors in your Flask terminal!
+        print(f"Backend Crash in lifestyle-data: {str(e)}") 
         return jsonify({"error": str(e)}), 500
 
-
+@app.route('/api/health-report/<string:user_id>', methods=['GET'])
+def get_health_report(user_id):
+    if db is None: return jsonify({"error": "Database unavailable"}), 503
+    try:
+        # Find the most recent blood report for this user
+        result = db.health_reports.find_one(
+            {"user_id": str(user_id), "report_type": "blood_report"},
+            sort=[("uploaded_at", -1)], # -1 gets the newest one if they uploaded multiple
+            projection={"_id": 0} # Hides the MongoDB ObjectID
+        )
+        return jsonify(result) if result else jsonify(None)
+    except Exception as e:
+        print(f"Error fetching health report: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+        
 # ==========================================
 # --------- CLINICAL & FILE UPLOAD ---------
 # ==========================================
