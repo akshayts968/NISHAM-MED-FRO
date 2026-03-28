@@ -85,3 +85,45 @@ def login(request, db):
         import traceback
         traceback.print_exc()
         return jsonify({"error": "Authentication failed", "details": str(e)}), 500
+
+
+
+def card_login(request, db):
+    data = request.json
+    card_id = data.get('cardId')
+
+    if not card_id:
+        return jsonify({"error": "Card ID is required"}), 400
+
+    try:
+        # Search for the user in MongoDB using the RFID hex string
+        user = db.users.find_one({"card_id": card_id})
+
+        if not user:
+            return jsonify({"error": "Unrecognized card. Please register this card first."}), 401
+
+        # Generate standard JWT token for the session
+        secret_key = os.environ.get('JWT_SECRET', 'my_super_secret_key')
+        payload = {
+            'id': str(user['_id']), 
+            'email': user.get('email', 'unknown'),
+            'exp': datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=24)
+        }
+        
+        token = jwt.encode(payload, secret_key, algorithm='HS256')
+        if isinstance(token, bytes):
+            token = token.decode('utf-8')
+
+        return jsonify({
+            "message": "Card Login successful",
+            "token": token,
+            "user": {
+                "id": str(user['_id']), 
+                "firstName": user.get('first_name', ''), 
+                "lastName": user.get('last_name', '')
+            }
+        }), 200
+
+    except Exception as e:
+        print(f"Card login error: {e}")
+        return jsonify({"error": "Authentication failed", "details": str(e)}), 500
