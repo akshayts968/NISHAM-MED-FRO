@@ -82,10 +82,11 @@ import os
 import joblib
 import tensorflow as tf
 
+base_dir = os.path.dirname(__file__)
 # Use an 'r' before the string so Windows backslashes don't break the path
-MODEL_PATH = r"D:\Nisham med\meb\model_1lead_500hz.h5"
-X_SCALER_PATH = r"D:\Nisham med\meb\X_scaler_500hz.pkl"
-Y_SCALER_PATH = r"D:\Nisham med\meb\Y_scaler_stats_500hz.pkl"
+MODEL_PATH = os.path.join(base_dir, 'model_1lead_500hz.h5')
+X_SCALER_PATH = os.path.join(base_dir, 'X_scaler_500hz.pkl')
+Y_SCALER_PATH = os.path.join(base_dir, 'Y_scaler_stats_500hz.pkl')
 
 print("--- DIAGNOSTICS ---")
 print(f"Can Python see the Model? : {os.path.exists(MODEL_PATH)}")
@@ -297,6 +298,22 @@ def upload_report():
         return jsonify({"error": "Failed to save data", "details": str(e)}), 500
 
 
+import wfdb
+import numpy as np
+import os
+from scipy.signal import butter, filtfilt
+
+# ==========================================
+# 1. DIGITAL FILTER FUNCTION
+# ==========================================
+def apply_bandpass_filter(data, lowcut=0.5, highcut=40.0, fs=500.0, order=3):
+    """Flattens breathing wander and removes 50/60Hz electrical fuzz."""
+    nyq = 0.5 * fs
+    low = lowcut / nyq
+    high = highcut / nyq
+    b, a = butter(order, [low, high], btype='band')
+    filtered_data = filtfilt(b, a, data) 
+    return filtered_data
 # ==========================================
 # ------- ML LIVE PREDICTION ROUTE ---------
 # ==========================================
@@ -313,34 +330,44 @@ def analyze_live_ecg():
         return jsonify({"error": "Machine Learning model or scalers are not loaded on the server"}), 500
 
     try:
-        signal = np.array(raw_data, dtype=float)
-        
         # 1. Crop or Pad to exactly 5000 points (10 seconds @ 500Hz)
         TARGET_LENGTH = 5000
+        signal = np.array(raw_data, dtype=float)
+        
         if len(signal) > TARGET_LENGTH:
             signal = signal[:TARGET_LENGTH] 
         elif len(signal) < TARGET_LENGTH:
             signal = np.pad(signal, (0, TARGET_LENGTH - len(signal)), 'constant')
             
-        # 2. Prepare the Signal (Y) -> Shape: (1, 5000, 1)
-        # We no longer pad it to 3 columns. It is strictly 1-lead.
-        Y_input = np.reshape(signal, (1, TARGET_LENGTH, 1))
+        # ==========================================
+        # 2. THE MISSING PHYSICS & FILTER BLOCK
+        # ==========================================
+        # Convert ADC (0-4095) to Volts (3.3V)
+        voltage = (signal / 4095.0) * 3.3
+        
+        # Center at 0.0
+        centered_voltage = voltage - np.mean(voltage)
+        
+        # Convert to true Millivolts (1100x Gain)
+        ecg_mv = centered_voltage / 1.1
+        
+        # Apply the SciPy Butterworth Filter (Removes baseline wander & noise)
+        clean_ecg_mv = apply_bandpass_filter(ecg_mv, lowcut=0.5, highcut=40.0, fs=500.0)
+
+        # 3. Prepare the Signal (Y) -> Shape: (1, 5000, 1)
+        Y_input = np.reshape(clean_ecg_mv, (1, TARGET_LENGTH, 1))
         
         # Scale using your pre-trained global stats from the .pkl file
         Y_input_scaled = (Y_input - Y_mean) / Y_std 
         
-        # 3. Prepare the Metadata (X) -> Shape: (1, 7)
-        # Exactly 7 features: [Age=50, Sex=1(Male), Height=170, Weight=70, Inf1=0, Inf2=0, Pace=0]
+        # 4. Prepare the Metadata (X) -> Shape: (1, 7)
         dummy_metadata = np.array([[50, 1, 170, 70, 0, 0, 0]])
         X_input_scaled = X_scaler.transform(dummy_metadata)
         
-        # 4. Normalize and Predict (Pass BOTH inputs to the multi-modal model)
+        # 5. Normalize and Predict (Pass BOTH inputs to the multi-modal model)
         pred = model.predict([X_input_scaled, Y_input_scaled], verbose=0)[0]
         
-        # 5. Format the Results
-        result = dict(zip(CLASSES, [float(p) for p in pred]))
-        best_diagnosis_code = max(result, key=result.get)
-        
+        # 6. Format the Results
         diagnosis_names = {
             'NORM': 'Normal Sinus Rhythm',
             'MI': 'Myocardial Infarction',
@@ -349,15 +376,20 @@ def analyze_live_ecg():
             'HYP': 'Hypertrophy'
         }
         
-        # Convert output to percentages for easier frontend reading
-        for key in result:
-            result[key] = round(result[key] * 100, 2)
+        raw_result = dict(zip(CLASSES, [float(p) for p in pred]))
+        best_diagnosis_code = max(raw_result, key=raw_result.get)
+        
+        # Convert ALL 5 probabilities into clean percentages with READABLE names
+        percentages_result = {}
+        for code, prob in raw_result.items():
+            readable_name = diagnosis_names.get(code, code)
+            percentages_result[readable_name] = round(prob * 100, 2)
         
         return jsonify({
             "message": "Success",
             "diagnosis": diagnosis_names.get(best_diagnosis_code, best_diagnosis_code),
-            "confidence": result[best_diagnosis_code],
-            "all_probabilities": result
+            "confidence": percentages_result[diagnosis_names.get(best_diagnosis_code)],
+            "all_probabilities": percentages_result
         }), 200
         
     except Exception as e:
@@ -503,14 +535,16 @@ def handle_ecg_stream(data):
         active_ecg_buffers[user_id] = [] 
         
         # Only print the first 5 numbers so you don't freeze your terminal!
-        print(f"🔍 Data Preview (First 5 points): {full_10s_ecg_data}", flush=True)
+        print(f"🔍 Data Preview (First 5 points): {full_10s_ecg_data[:5]}", flush=True)
         print(f"📦 {TARGET_LENGTH} samples collected for {user_id}! Running AI Prediction...", flush=True)
 
         # ---------------------------------------------------------
         # AI PREDICTION BLOCK
         # ---------------------------------------------------------
-        best_diagnosis = "Unknown"
-        confidence = 0.0
+        # Default fallback variables in case the AI fails or is offline
+        final_diagnosis = "Unknown"
+        final_confidence = 0.0
+        percentages_result = {}
 
         if model is not None and X_scaler is not None:
             try:
@@ -525,65 +559,79 @@ def handle_ecg_stream(data):
                 
                 # 4. Convert to true Millivolts (Assuming AD8232 1100x Gain)
                 ecg_mv = centered_voltage / 1.1
+                
+                # ---> 4.5 APPLY DIGITAL FILTER <---
+                # Flattens the breathing wander so the AI doesn't hallucinate an MI
+                clean_ecg_mv = apply_bandpass_filter(ecg_mv, lowcut=0.5, highcut=40.0, fs=500.0)
+
+                # Optional: Print preview to terminal
                 print("\n🔍 --- CONVERSION PREVIEW (First 5 points) ---", flush=True)
                 print(f"1. Raw ADC      : {np.round(raw_adc[:5], 1)}")
-                print(f"2. Volts (V)    : {np.round(voltage[:5], 3)}")
-                print(f"3. Centered (V) : {np.round(centered_voltage[:5], 3)}")
                 print(f"4. True ECG (mV): {np.round(ecg_mv[:5], 3)}")
+                print(f"5. Filtered (mV): {np.round(clean_ecg_mv[:5], 3)}")
                 print("----------------------------------------------\n", flush=True)
-                # 5. Prepare Signal (Y) -> Shape: (1, 5000, 1)
-                Y_input = np.reshape(ecg_mv, (1, TARGET_LENGTH, 1))
                 
-                # ---> 6. APPLY THE .PKL SCALER (THE CRITICAL FIX) <---
+                # 5. Prepare Signal (Y) -> Shape: (1, 5000, 1)
+                Y_input = np.reshape(clean_ecg_mv, (1, TARGET_LENGTH, 1))
+                
+                # 6. APPLY THE .PKL SCALER 
                 Y_input_scaled = (Y_input - Y_mean) / Y_std 
                 
                 # 7. Prepare Metadata (X) -> Shape: (1, 7)
                 dummy_metadata = np.array([[50, 1, 170, 70, 0, 0, 0]])
                 X_input_scaled = X_scaler.transform(dummy_metadata)
                 
-                # 8. Predict (Pass the scaled inputs!)
+                # 8. Predict
                 pred = model.predict([X_input_scaled, Y_input_scaled], verbose=0)[0]
-                result = dict(zip(CLASSES, [float(p) for p in pred]))
                 
-                best_diagnosis = max(result, key=result.get)
-                confidence = round(result[best_diagnosis] * 100, 1)
+                # Map acronyms to readable names
+                diagnosis_names = {
+                    'NORM': 'Normal Sinus Rhythm', 
+                    'MI': 'Myocardial Infarction', 
+                    'STTC': 'ST/T Change', 
+                    'CD': 'Conduction Disturbance', 
+                    'HYP': 'Hypertrophy'
+                }
+                
+                raw_result = dict(zip(CLASSES, [float(p) for p in pred]))
+                best_diagnosis_code = max(raw_result, key=raw_result.get)
+                
+                # Convert ALL 5 probabilities into clean percentages
+                for code, prob in raw_result.items():
+                    readable_name = diagnosis_names.get(code, code)
+                    percentages_result[readable_name] = round(prob * 100, 2)
+                    
+                # Set the final variables that will be emitted and saved
+                final_diagnosis = diagnosis_names.get(best_diagnosis_code, best_diagnosis_code)
+                final_confidence = percentages_result[final_diagnosis]
 
             except Exception as e:
                 print(f"⚠️ AI Prediction Error: {e}", flush=True)
-                best_diagnosis = "AI Error"
+                final_diagnosis = "AI Error"
         else:
-            best_diagnosis = "Model Offline"
+            final_diagnosis = "Model Offline"
 
-        # Map acronyms to readable names
-        diagnosis_names = {
-            'NORM': 'Normal Sinus Rhythm', 
-            'MI': 'Myocardial Infarction', 
-            'STTC': 'ST/T Change', 
-            'CD': 'Conduction Disturbance', 
-            'HYP': 'Hypertrophy'
-        }
-        readable_diagnosis = diagnosis_names.get(best_diagnosis, best_diagnosis)
-
-        # Send the result to the React screen
+        # ---------------------------------------------------------
+        # EMIT RESULT TO FRONTEND (HAPPENS ONCE)
+        # ---------------------------------------------------------
         emit('prediction_result', {
-            "diagnosis": readable_diagnosis, 
-            "confidence": confidence
+            "diagnosis": final_diagnosis, 
+            "confidence": final_confidence,
+            "all_probabilities": percentages_result
         }, broadcast=True)
 
         # ---------------------------------------------------------
         # LONG-TERM STORAGE: Save to MongoDB
         # ---------------------------------------------------------
-        # Only attempt to save if the 'db' variable actually exists and is connected
         if 'db' in globals() and db is not None:
             try:
                 record_doc = {
                     "user_id": user_id,
                     "timestamp": datetime.datetime.now(datetime.timezone.utc),
-                    "diagnosis": readable_diagnosis,
-                    "confidence": confidence,
-                    "ecg_data_array": full_10s_ecg_data # Saves all 5000 points!
+                    "diagnosis": final_diagnosis,
+                    "confidence": final_confidence,
+                    "ecg_data_array": full_10s_ecg_data # Saves all 5000 raw points
                 }
-                # Insert into a new 'ecg_records' collection in your database
                 db.ecg_records.insert_one(record_doc)
                 print(f"💾 Record successfully saved to MongoDB for {user_id}", flush=True)
                 
