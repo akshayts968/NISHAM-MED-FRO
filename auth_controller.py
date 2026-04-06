@@ -38,7 +38,6 @@ def signup(request, db):
     except Exception as e:
         return jsonify({"error": "Server error", "details": str(e)}), 500
 
-
 def login(request, db):
     data = request.json
     email = data.get('email')
@@ -59,10 +58,11 @@ def login(request, db):
         if not bcrypt.checkpw(password.encode('utf-8'), stored_password):
             return jsonify({"error": "Invalid email or password"}), 401
 
-        secret_key = os.environ.get('JWT_SECRET', 'fallback_secret_for_dev_only')
+        # ✅ FIX 1: Standardized fallback secret key
+        secret_key = os.environ.get('JWT_SECRET', 'YOUR_SECRET_KEY')
         
         payload = {
-            'id': str(user['_id']), # Convert MongoDB ObjectId to string
+            'user_id': str(user['_id']), # ✅ FIX 2: Changed 'id' to 'user_id'
             'email': user['email'],
             'exp': datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=24)
         }
@@ -87,7 +87,6 @@ def login(request, db):
         return jsonify({"error": "Authentication failed", "details": str(e)}), 500
 
 
-
 def card_login(request, db):
     data = request.json
     card_id = data.get('cardId')
@@ -102,10 +101,11 @@ def card_login(request, db):
         if not user:
             return jsonify({"error": "Unrecognized card. Please register this card first."}), 401
 
-        # Generate standard JWT token for the session
-        secret_key = os.environ.get('JWT_SECRET', 'my_super_secret_key')
+        # ✅ FIX 1: Standardized fallback secret key
+        secret_key = os.environ.get('JWT_SECRET', 'YOUR_SECRET_KEY')
+        
         payload = {
-            'id': str(user['_id']), 
+            'user_id': str(user['_id']), # ✅ FIX 2: Changed 'id' to 'user_id'
             'email': user.get('email', 'unknown'),
             'exp': datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=24)
         }

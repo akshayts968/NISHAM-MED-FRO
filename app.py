@@ -88,6 +88,34 @@ MODEL_PATH = os.path.join(base_dir, 'model_1lead_500hz.h5')
 X_SCALER_PATH = os.path.join(base_dir, 'X_scaler_500hz.pkl')
 Y_SCALER_PATH = os.path.join(base_dir, 'Y_scaler_stats_500hz.pkl')
 
+import os
+import joblib
+import numpy as np
+
+# ==========================================
+# LOAD BLOOD AI MODEL & SCALER
+# ==========================================
+try:
+    print("🧠 Loading Blood Biomarker Model...", flush=True)
+    
+    # 1. Find the exact folder where this app.py file lives
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # 2. Build the exact file paths
+    blood_scaler_path = os.path.join(base_dir, 'medical_scaler.pkl')
+    blood_model_path = os.path.join(base_dir, 'cardiology_rf_model.pkl')
+    
+    # 3. Load the files using the secure paths
+    blood_scaler = joblib.load(blood_scaler_path)
+    blood_model = joblib.load(blood_model_path)
+    
+    print("✓ Blood AI Model & Scaler loaded successfully!", flush=True)
+    
+except Exception as e:
+    print(f"⚠️ Blood AI Initialization Error: {e}", flush=True)
+    blood_scaler = None
+    blood_model = None
+
 print("--- DIAGNOSTICS ---")
 print(f"Can Python see the Model? : {os.path.exists(MODEL_PATH)}")
 print(f"Can Python see X_Scaler?: {os.path.exists(X_SCALER_PATH)}")
@@ -118,6 +146,202 @@ except Exception as e:
 # ==========================================
 # -------------- AUTH ROUTES ---------------
 # ==========================================
+import jwt
+from functools import wraps
+from flask import request, jsonify
+from bson.objectid import ObjectId
+
+# --- JWT Authentication Middleware ---
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = None
+        # Check if token is in the headers
+        if 'Authorization' in request.headers:
+            token = request.headers['Authorization'].split(" ")[1] # Bearer <token>
+            
+        if not token:
+            return jsonify({"error": "Token is missing!"}), 401
+            
+        try:
+            # Decode the token (Make sure 'YOUR_SECRET_KEY' matches your login route!)
+            data = jwt.decode(token, os.getenv('JWT_SECRET', 'YOUR_SECRET_KEY'), algorithms=["HS256"])
+            # Fetch the user from MongoDB
+            current_user = db.users.find_one({"_id": ObjectId(data["user_id"])})
+            
+            if not current_user:
+                return jsonify({"error": "User not found!"}), 401
+                
+        except Exception as e:
+            return jsonify({"error": "Token is invalid!", "details": str(e)}), 401
+            
+        return f(current_user, *args, **kwargs)
+    return decorated
+
+
+# --- Profile GET Route ---
+@app.route('/api/profile', methods=['GET'])
+@token_required
+def get_profile(current_user):
+    try:
+        # Return the user data (Exclude the password!)
+        user_profile = {
+            "id": str(current_user.get("_id")),
+            "firstName": current_user.get("first_name", "Unknown"),
+            "lastName": current_user.get("last_name", ""),
+            "email": current_user.get("email", "No Email Provided"),
+            "mobile": current_user.get("mobile", "No Phone Provided"), # Added Mobile!
+            "role": current_user.get("role", "Patient"), # Changed to Patient
+            "cardId": current_user.get("card_id", "Not Linked")
+        }
+        
+        return jsonify({
+            "status": "success",
+            "user": user_profile
+        }), 200
+        
+    except Exception as e:
+        print(f"❌ Profile Fetch Error: {e}", flush=True)
+        return jsonify({"error": "Failed to fetch profile"}), 500
+    
+# ==========================================
+# --------- BLOOD BIOMARKER ROUTE ----------
+# ==========================================
+import datetime
+
+# ==========================================
+# --------- BLOOD BIOMARKER ROUTE ----------
+# ==========================================
+@app.route('/api/analyze-blood', methods=['POST'])
+def analyze_blood():
+    data = request.json
+    
+    try:
+        # 1. Extract variables from React
+        user_id = str(data.get('userId', 'guest'))
+        troponin = float(data.get('Troponin_I_ng_mL', 0.0))
+        ck_mb = float(data.get('CK_MB_ng_mL', 0.0))
+        bnp = float(data.get('BNP_pg_mL', 0.0))
+        potassium = float(data.get('Potassium_mEq_L', 0.0))
+        creatinine = float(data.get('Creatinine_mg_dL', 0.0))
+        
+        print(f"🩸 Received Data: Trop={troponin}, CK-MB={ck_mb}, BNP={bnp}, K={potassium}, Cr={creatinine}", flush=True)
+
+        # 2. Safety Check: Are the models online?
+        if blood_scaler is None or blood_model is None:
+            return jsonify({"error": "Blood AI models are offline on the server."}), 500
+
+        # 3. Format the array EXACTLY in the order the scaler was trained!
+        patient_features = np.array([[troponin, ck_mb, bnp, potassium, creatinine]])
+
+        # 4. Scale the Data
+        scaled_features = blood_scaler.transform(patient_features)
+
+        # 5. Make the AI Prediction
+        prediction_code = blood_model.predict(scaled_features)[0]
+        
+        probabilities = blood_model.predict_proba(scaled_features)[0]
+        confidence = round(max(probabilities) * 100, 2)
+
+        # 6. Map the numeric result to a readable hospital diagnosis
+        if str(prediction_code) == "1" or str(prediction_code).lower() == "myocardial infarction":
+            final_diagnosis = "High Risk - Myocardial Infarction Detected"
+        else:
+            final_diagnosis = "Normal Blood Biomarkers"
+
+        # ==========================================
+        # 7. LONG-TERM STORAGE: Save to MongoDB
+        # ==========================================
+        if 'db' in globals() and db is not None and user_id != 'guest':
+            try:
+                blood_record = {
+                    "user_id": user_id,
+                    "timestamp": datetime.datetime.now(datetime.timezone.utc),
+                    "biomarkers": {
+                        "Troponin_I": troponin,
+                        "CK_MB": ck_mb,
+                        "BNP": bnp,
+                        "Potassium": potassium,
+                        "Creatinine": creatinine
+                    },
+                    "diagnosis": final_diagnosis,
+                    "confidence": confidence
+                }
+                # This automatically creates a new collection called 'blood_records'
+                db.blood_records.insert_one(blood_record)
+                print(f"💾 Blood record successfully saved to MongoDB for user {user_id}", flush=True)
+                
+            except Exception as db_err:
+                print(f"❌ Failed to save blood data to database: {db_err}", flush=True)
+
+
+        return jsonify({
+            "status": "success",
+            "diagnosis": final_diagnosis,
+            "confidence": confidence
+        }), 200
+
+    except Exception as e:
+        print(f"❌ Blood Analysis Error: {e}", flush=True)
+        return jsonify({"error": str(e)}), 500
+# ==========================================
+# --------- ECG HISTORY ROUTE --------------
+# ==========================================
+
+
+# ==========================================
+# --------- BLOOD HISTORY ROUTE ------------
+# ==========================================
+@app.route('/api/blood-records/<string:user_id>', methods=['GET'])
+def get_blood_records(user_id):
+    if 'db' not in globals() or db is None: 
+        return jsonify({"error": "Database unavailable"}), 503
+        
+    try:
+        # Fetch records, sort by newest first (-1), and hide the MongoDB Object ID
+        records = list(db.blood_records.find(
+            {"user_id": str(user_id)}, 
+            {"_id": 0}
+        ).sort("timestamp", -1))
+        
+        # Convert Datetime objects into strings for React
+        for rec in records:
+            if 'timestamp' in rec and rec['timestamp']:
+                rec['timestamp'] = rec['timestamp'].isoformat()
+                
+        return jsonify({
+            "status": "success", 
+            "records": records
+        }), 200
+        
+    except Exception as e:
+        print(f"❌ Error fetching blood records: {e}", flush=True)
+        return jsonify({"error": str(e)}), 500
+    
+    
+@app.route('/api/ecg-records/<string:user_id>', methods=['GET'])
+def get_ecg_records(user_id):
+    if db is None: return jsonify({"error": "Database unavailable"}), 503
+    try:
+        # Fetch all records for this user, sorted by timestamp (-1 means newest first)
+        records = list(db.ecg_records.find(
+            {"user_id": str(user_id)}, 
+            {"_id": 0} # Hide the MongoDB ObjectID so it doesn't break React
+        ).sort("timestamp", -1))
+        
+        # Convert complex Datetime objects into normal strings for the frontend
+        for rec in records:
+            if 'timestamp' in rec:
+                rec['timestamp'] = rec['timestamp'].isoformat()
+                
+        return jsonify({
+            "status": "success", 
+            "records": records
+        }), 200
+        
+    except Exception as e:
+        print(f"❌ Error fetching ECG records: {e}", flush=True)
+        return jsonify({"error": str(e)}), 500
 @app.route('/api/auth/signup', methods=['POST'])
 def signup_route():
     if db is None: return jsonify({"error": "Database unavailable"}), 503
@@ -146,7 +370,7 @@ def get_medical_history(user_id):
         return jsonify(result) if result else jsonify(None)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
+    
 @app.route('/api/medical-history', methods=['POST'])
 def save_medical_history():
     if db is None: return jsonify({"error": "Database unavailable"}), 503
@@ -156,7 +380,17 @@ def save_medical_history():
         update_data = {
             "user_id": str(data.get('userId')),
             "age": data.get('age'),
-            "sex": data.get('sex'),
+            "sex": data.get('sex'), 
+            
+            # --- New AI Metadata Fields ---
+            "height": data.get('height'),
+            "weight": data.get('weight'),
+            "inf1": 1 if data.get('inf1') == 'yes' else 0,
+            "inf2": 1 if data.get('inf2') == 'yes' else 0,
+            "pace": 1 if data.get('pace') == 'yes' else 0,
+            "extra": 1 if data.get('extra') == 'yes' else 0,
+            
+            # --- Original Fields ---
             "family_heart_history": 1 if data.get('familyHistory') == 'yes' else 0,
             "past_heart_problem": data.get('pastHeartProblem')
         }
@@ -170,8 +404,6 @@ def save_medical_history():
         return jsonify({"message": "Medical history saved successfully!"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-
 # ==========================================
 # --------- LIFESTYLE DATA ROUTES ----------
 # ==========================================
@@ -418,6 +650,10 @@ def analyze_wfdb():
 
     hea_file = request.files['hea']
     dat_file = request.files['dat']
+    
+    # Grab the userId sent from the React frontend (we will need to append this in React!)
+    user_id = request.form.get('userId') 
+    print(f"✅ Successfully read {user_id}!", flush=True)
 
     # 1. Create a secure temporary directory that auto-deletes
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -434,8 +670,7 @@ def analyze_wfdb():
             record_path = os.path.join(temp_dir, base_name)
             record = wfdb.rdsamp(record_path)
             
-            # Extract the raw signal array (Assuming Lead II is channel 0 or 1 depending on the file)
-            # You might need to adjust the index if Lead II isn't the first channel in your specific .dat files
+            # Extract the raw signal array
             signal_data = record[0][:, 0] 
             
             print(f"✅ Successfully read {len(signal_data)} samples from {base_name}.hea!", flush=True)
@@ -453,26 +688,47 @@ def analyze_wfdb():
             if model is not None and X_scaler is not None:
                 
                 # --- A. PREPARE THE SIGNAL (Y) ---
-                # Shape it to (1, 5000, 1) for the 1D CNN
                 Y_input = np.reshape(signal_data, (1, TARGET_LENGTH, 1))
-                
-                # Scale using the saved training statistics (Globals loaded at app startup)
                 Y_input_scaled = (Y_input - Y_mean) / Y_std 
                 
-                # --- B. PREPARE THE METADATA (X) ---
-                # Since the WFDB upload doesn't have patient vitals, we use a default baseline profile.
-                # [Age=50, Sex=1(Male), Height=170, Weight=70, Inf1=0, Inf2=0, Pace=0, Extra=0]
-                dummy_metadata = np.array([[50, 1, 170, 70, 0, 0, 0]])
-                X_input_scaled = X_scaler.transform(dummy_metadata)
+                # --- B. PREPARE THE METADATA (X) FROM DATABASE ---
+                # Step 1: Set default baseline values (Fallback)
+                age, sex, height, weight, inf1, inf2, pace = 50.0, 1.0, 170.0, 70.0, 0.0, 0.0, 0.0
+                
+                # Step 2: Try to fetch the real data from MongoDB
+                if db is not None and user_id:
+                    try:
+                        user_data = db.medical_history.find_one({"user_id": str(user_id)})
+                        if user_data:
+                            # Safely extract and cast data from DB, using defaults if fields are empty
+                            age = float(user_data.get('age') or age)
+                            sex_val = user_data.get('sex', 'male')
+                            sex = 1.0 if str(sex_val).lower() == 'male' else 0.0
+                            height = float(user_data.get('height') or height)
+                            weight = float(user_data.get('weight') or weight)
+                            inf1 = float(user_data.get('inf1') or inf1)
+                            inf2 = float(user_data.get('inf2') or inf2)
+                            pace = float(user_data.get('pace') or pace)
+                            
+                            print(f"📊 Loaded DB Profile for user {user_id}: Age={age}, Sex={sex_val}", flush=True)
+                        else:
+                            print(f"⚠️ No DB profile found for user {user_id}, using defaults.", flush=True)
+                    except Exception as db_err:
+                        print(f"⚠️ DB Fetch Error: {db_err}. Falling back to defaults.", flush=True)
+
+                # Step 3: Format into array (Ensure the length exactly matches what X_scaler expects!)
+                # Note: If your scaler was trained on 8 features including 'Extra', add it here.
+                patient_metadata = np.array([[age, sex, height, weight, inf1, inf2, pace]])
+                X_input_scaled = X_scaler.transform(patient_metadata)
                 
                 # --- C. PREDICT ---
-                # The model requires both inputs in a list: [Metadata, Signal]
                 pred = model.predict([X_input_scaled, Y_input_scaled], verbose=0)[0]
                 
                 result = dict(zip(CLASSES, [float(p) for p in pred]))
                 best_diagnosis = max(result, key=result.get)
                 confidence = float(result[best_diagnosis])
                 print(f"My predictions are: {result}", flush=True)
+                
                 diagnosis_names = {
                     'NORM': 'Normal Sinus Rhythm', 
                     'MI': 'Myocardial Infarction', 
@@ -486,7 +742,7 @@ def analyze_wfdb():
                     "status": "success",
                     "diagnosis": readable_diagnosis,
                     "confidence": confidence,
-                    "all_probabilities": result # Helpful for debugging frontend
+                    "all_probabilities": result
                 }), 200
             else:
                 return jsonify({"error": "AI Model or Scalers are offline."}), 500
@@ -533,7 +789,16 @@ def handle_ecg_stream(data):
         
         # Instantly empty the buffer so the next 10 seconds can start collecting immediately
         active_ecg_buffers[user_id] = [] 
+
+        real_user_id = user_id # Fallback in case it's a guest or React test
         
+        if 'db' in globals() and db is not None and user_id != 'guest':
+            # Check if the incoming ID matches an RFID card in the system
+            user_lookup = db.users.find_one({"card_id": user_id})
+            if user_lookup:
+                real_user_id = str(user_lookup["_id"])
+                print(f"🔄 Link Found: Translated RFID [{user_id}] to DB ID [{real_user_id}]", flush=True)
+
         # Only print the first 5 numbers so you don't freeze your terminal!
         print(f"🔍 Data Preview (First 5 points): {full_10s_ecg_data[:5]}", flush=True)
         print(f"📦 {TARGET_LENGTH} samples collected for {user_id}! Running AI Prediction...", flush=True)
@@ -561,15 +826,7 @@ def handle_ecg_stream(data):
                 ecg_mv = centered_voltage / 1.1
                 
                 # ---> 4.5 APPLY DIGITAL FILTER <---
-                # Flattens the breathing wander so the AI doesn't hallucinate an MI
                 clean_ecg_mv = apply_bandpass_filter(ecg_mv, lowcut=0.5, highcut=40.0, fs=500.0)
-
-                # Optional: Print preview to terminal
-                print("\n🔍 --- CONVERSION PREVIEW (First 5 points) ---", flush=True)
-                print(f"1. Raw ADC      : {np.round(raw_adc[:5], 1)}")
-                print(f"4. True ECG (mV): {np.round(ecg_mv[:5], 3)}")
-                print(f"5. Filtered (mV): {np.round(clean_ecg_mv[:5], 3)}")
-                print("----------------------------------------------\n", flush=True)
                 
                 # 5. Prepare Signal (Y) -> Shape: (1, 5000, 1)
                 Y_input = np.reshape(clean_ecg_mv, (1, TARGET_LENGTH, 1))
@@ -577,11 +834,40 @@ def handle_ecg_stream(data):
                 # 6. APPLY THE .PKL SCALER 
                 Y_input_scaled = (Y_input - Y_mean) / Y_std 
                 
-                # 7. Prepare Metadata (X) -> Shape: (1, 7)
-                dummy_metadata = np.array([[50, 1, 170, 70, 0, 0, 0]])
-                X_input_scaled = X_scaler.transform(dummy_metadata)
+                # ---------------------------------------------------------
+                # 7. Prepare Metadata (X) FROM MONGODB
+                # ---------------------------------------------------------
+                # Set default fallback values
+                age, sex, height, weight, inf1, inf2, pace = 50.0, 1.0, 170.0, 70.0, 0.0, 0.0, 0.0
                 
+                # Try to fetch the real data from MongoDB
+                if 'db' in globals() and db is not None and user_id != 'guest':
+                    try:
+                        user_data = db.medical_history.find_one({"user_id": str(user_id)})
+                        if user_data:
+                            # Safely extract and cast data from DB, using defaults if fields are empty
+                            age = float(user_data.get('age') or age)
+                            sex_val = user_data.get('sex', 'male')
+                            sex = 1.0 if str(sex_val).lower() == 'male' else 0.0
+                            height = float(user_data.get('height') or height)
+                            weight = float(user_data.get('weight') or weight)
+                            inf1 = float(user_data.get('inf1') or inf1)
+                            inf2 = float(user_data.get('inf2') or inf2)
+                            pace = float(user_data.get('pace') or pace)
+                            
+                            print(f"📊 Loaded DB Profile for Live Stream: User {user_id}", flush=True)
+                        else:
+                            print(f"⚠️ No DB profile found for user {user_id}, using defaults.", flush=True)
+                    except Exception as db_err:
+                        print(f"⚠️ DB Fetch Error: {db_err}. Falling back to defaults.", flush=True)
+
+                # Format into array and Scale
+                patient_metadata = np.array([[age, sex, height, weight, inf1, inf2, pace]])
+                X_input_scaled = X_scaler.transform(patient_metadata)
+                
+                # ---------------------------------------------------------
                 # 8. Predict
+                # ---------------------------------------------------------
                 pred = model.predict([X_input_scaled, Y_input_scaled], verbose=0)[0]
                 
                 # Map acronyms to readable names
@@ -626,19 +912,21 @@ def handle_ecg_stream(data):
         if 'db' in globals() and db is not None:
             try:
                 record_doc = {
-                    "user_id": user_id,
+                    "user_id": real_user_id,
+                    "RF_ID": user_id,
                     "timestamp": datetime.datetime.now(datetime.timezone.utc),
                     "diagnosis": final_diagnosis,
                     "confidence": final_confidence,
                     "ecg_data_array": full_10s_ecg_data # Saves all 5000 raw points
                 }
                 db.ecg_records.insert_one(record_doc)
-                print(f"💾 Record successfully saved to MongoDB for {user_id}", flush=True)
+                print(f"💾 Record successfully saved to MongoDB for {real_user_id} with RFID of {user_id}", flush=True)
                 
             except Exception as e:
                 print(f"❌ Failed to save to database: {e}", flush=True)
         else:
             print("⚠️ Skipping DB save: MongoDB is not connected to the server.", flush=True)
+
 
 @socketio.on('hardware_login_attempt')
 def handle_hardware_login(data):
