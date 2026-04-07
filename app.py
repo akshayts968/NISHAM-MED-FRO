@@ -212,73 +212,83 @@ import datetime
 # ==========================================
 # --------- BLOOD BIOMARKER ROUTE ----------
 # ==========================================
+# ==========================================
+# BLOOD AI PREDICTION ROUTE (UPDATED)
+# ==========================================
 @app.route('/api/analyze-blood', methods=['POST'])
 def analyze_blood():
     data = request.json
+    user_id = str(data.get('userId', 'guest'))
     
-    try:
-        # 1. Extract variables from React
-        user_id = str(data.get('userId', 'guest'))
-        troponin = float(data.get('Troponin_I_ng_mL', 0.0))
-        ck_mb = float(data.get('CK_MB_ng_mL', 0.0))
-        bnp = float(data.get('BNP_pg_mL', 0.0))
-        potassium = float(data.get('Potassium_mEq_L', 0.0))
-        creatinine = float(data.get('Creatinine_mg_dL', 0.0))
-        
-        print(f"🩸 Received Data: Trop={troponin}, CK-MB={ck_mb}, BNP={bnp}, K={potassium}, Cr={creatinine}", flush=True)
+    if user_id == 'guest':
+        return jsonify({"error": "Patient must be logged in to analyze blood data."}), 400
 
-        # 2. Safety Check: Are the models online?
+    try:
+        # 1. FETCH DATA FROM MONGODB (We don't rely on React for the numbers anymore!)
+        if 'db' not in globals() or db is None:
+            return jsonify({"error": "Database unavailable"}), 503
+            
+        user_data = db.medical_history.find_one({"user_id": user_id})
+        
+        if not user_data:
+            return jsonify({"error": "No medical history found. Please fill out patient profile first."}), 404
+
+        # 2. Extract Biomarkers from the Database (Fallback to 0.0 if empty)
+        troponin = float(user_data.get('troponin') or 0.0)
+        ck_mb = float(user_data.get('ck_mb') or 0.0)
+        bnp = float(user_data.get('bnp') or 0.0)
+        potassium = float(user_data.get('potassium') or 0.0)
+        creatinine = float(user_data.get('creatinine') or 0.0)
+        
+        # 3. Safety Check: Did they actually enter blood data?
+        if all(v == 0.0 for v in [troponin, ck_mb, bnp, potassium, creatinine]):
+            return jsonify({"error": "No blood biomarker data found in patient's Medical History."}), 400
+
+        print(f"🩸 DB Data Pulled: Trop={troponin}, CK-MB={ck_mb}, BNP={bnp}, K={potassium}, Cr={creatinine}", flush=True)
+
+        # 4. Check Models
         if blood_scaler is None or blood_model is None:
             return jsonify({"error": "Blood AI models are offline on the server."}), 500
 
-        # 3. Format the array EXACTLY in the order the scaler was trained!
+        # 5. Format, Scale, and Predict
         patient_features = np.array([[troponin, ck_mb, bnp, potassium, creatinine]])
-
-        # 4. Scale the Data
         scaled_features = blood_scaler.transform(patient_features)
-
-        # 5. Make the AI Prediction
-        prediction_code = blood_model.predict(scaled_features)[0]
         
+        prediction_code = blood_model.predict(scaled_features)[0]
         probabilities = blood_model.predict_proba(scaled_features)[0]
         confidence = round(max(probabilities) * 100, 2)
 
-        # 6. Map the numeric result to a readable hospital diagnosis
+        # 6. Map Diagnosis
         if str(prediction_code) == "1" or str(prediction_code).lower() == "myocardial infarction":
             final_diagnosis = "High Risk - Myocardial Infarction Detected"
         else:
             final_diagnosis = "Normal Blood Biomarkers"
 
-        # ==========================================
-        # 7. LONG-TERM STORAGE: Save to MongoDB
-        # ==========================================
-        if 'db' in globals() and db is not None and user_id != 'guest':
-            try:
-                blood_record = {
-                    "user_id": user_id,
-                    "timestamp": datetime.datetime.now(datetime.timezone.utc),
-                    "biomarkers": {
-                        "Troponin_I": troponin,
-                        "CK_MB": ck_mb,
-                        "BNP": bnp,
-                        "Potassium": potassium,
-                        "Creatinine": creatinine
-                    },
-                    "diagnosis": final_diagnosis,
-                    "confidence": confidence
-                }
-                # This automatically creates a new collection called 'blood_records'
-                db.blood_records.insert_one(blood_record)
-                print(f"💾 Blood record successfully saved to MongoDB for user {user_id}", flush=True)
-                
-            except Exception as db_err:
-                print(f"❌ Failed to save blood data to database: {db_err}", flush=True)
+        # 7. Update Record (We save the prediction back into their medical history)
+        # ... (Previous code)
+        # 7. Update Record (We save the prediction back into their medical history)
+        db.medical_history.update_one(
+            {"user_id": user_id},
+            {"$set": {
+                "latest_blood_diagnosis": final_diagnosis,
+                "latest_blood_confidence": confidence,
+                "last_blood_analysis_time": datetime.datetime.now(datetime.timezone.utc)
+            }}
+        )
+        print(f"💾 Blood prediction successfully saved to MongoDB for user {user_id}", flush=True)
 
-
+        # ---> ADD THE BIOMARKERS TO THE RESPONSE HERE <---
         return jsonify({
             "status": "success",
             "diagnosis": final_diagnosis,
-            "confidence": confidence
+            "confidence": confidence,
+            "biomarkers": {
+                "troponin": troponin,
+                "ck_mb": ck_mb,
+                "bnp": bnp,
+                "potassium": potassium,
+                "creatinine": creatinine
+            }
         }), 200
 
     except Exception as e:
@@ -318,7 +328,7 @@ def get_blood_records(user_id):
         print(f"❌ Error fetching blood records: {e}", flush=True)
         return jsonify({"error": str(e)}), 500
     
-    
+
 @app.route('/api/ecg-records/<string:user_id>', methods=['GET'])
 def get_ecg_records(user_id):
     if db is None: return jsonify({"error": "Database unavailable"}), 503
@@ -375,7 +385,11 @@ def get_medical_history(user_id):
 def save_medical_history():
     if db is None: return jsonify({"error": "Database unavailable"}), 503
     data = request.json
-
+    troponin = float(data.get('troponin')) if data.get('troponin') else 0
+    ck_mb = float(data.get('ck_mb')) if data.get('ck_mb') else 5
+    bnp = float(data.get('bnp')) if data.get('bnp') else 2
+    potassium = float(data.get('potassium')) if data.get('potassium') else 0.2
+    creatinine = float(data.get('creatinine')) if data.get('creatinine') else 0.2
     try:
         update_data = {
             "user_id": str(data.get('userId')),
@@ -392,7 +406,12 @@ def save_medical_history():
             
             # --- Original Fields ---
             "family_heart_history": 1 if data.get('familyHistory') == 'yes' else 0,
-            "past_heart_problem": data.get('pastHeartProblem')
+            "past_heart_problem": data.get('pastHeartProblem'),
+            "troponin": troponin,
+            "ck_mb": ck_mb,
+            "bnp": bnp,
+            "potassium": potassium,
+            "creatinine": creatinine
         }
         
         # Upsert=True means "Update if exists, Create if it doesn't"
@@ -905,7 +924,11 @@ def handle_ecg_stream(data):
             "confidence": final_confidence,
             "all_probabilities": percentages_result
         }, broadcast=True)
-
+        emit('esp32_prediction_feedback', {
+            "diag": final_diagnosis,
+            "code": best_diagnosis_code, # e.g., 'NORM', 'MI'
+            "conf": final_confidence
+        }, broadcast=True)
         # ---------------------------------------------------------
         # LONG-TERM STORAGE: Save to MongoDB
         # ---------------------------------------------------------
