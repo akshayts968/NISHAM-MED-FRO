@@ -77,7 +77,8 @@ def login(request, db):
             "user": {
                 "id": str(user['_id']), 
                 "firstName": user.get('first_name'), 
-                "lastName": user.get('last_name')
+                "lastName": user.get('last_name'),
+                "role": user.get('role', 'patient')
             }
         }), 200
 

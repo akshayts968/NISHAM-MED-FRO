@@ -11,7 +11,7 @@ import pickle
 import wfdb
 import uuid
 import jwt
-from pymongo import MongoClient
+from pymongo import MongoClient, ReturnDocument
 import cloudinary
 import cloudinary.uploader
 from flask_socketio import SocketIO, emit
@@ -977,6 +977,332 @@ def handle_hardware_login(data):
         
     except Exception as e:
         emit('login_error', {"error": str(e)}, broadcast=True)      
+
+# ==========================================
+# --------- RESPIRATORY API ROUTES ---------
+# ==========================================
+@app.route('/api/analyze-spirometry', methods=['POST'])
+def analyze_spirometry():
+    if db is None: return jsonify({"error": "Database unavailable"}), 503
+    data = request.json
+    user_id = str(data.get('userId', 'guest'))
+    
+    try:
+        fev1 = float(data.get('fev1', 0))
+        fvc = float(data.get('fvc', 0))
+        pef = float(data.get('pef', 0) or 0)
+        
+        # Rule-based diagnostic logic
+        ratio = (fev1 / fvc) * 100 if fvc > 0 else 0
+        ratio = round(ratio, 2)
+        
+        status = "success"
+        if ratio < 70:
+            diagnosis = "Possible Obstructive Defect (e.g., Asthma, COPD)"
+            status = "warning"
+            if fev1 < 1.5:
+                status = "danger"
+        elif fvc < 3.0: # Simplistic threshold for demonstration
+            diagnosis = "Possible Restrictive Defect"
+            status = "warning"
+        else:
+            diagnosis = "Normal Spirometry"
+            
+        result = {
+            "status": status,
+            "diagnosis": diagnosis,
+            "ratio": ratio
+        }
+        
+        # Save to DB if not guest
+        if user_id != 'guest':
+            db.respiratory_history.insert_one({
+                "user_id": user_id,
+                "fev1": fev1,
+                "fvc": fvc,
+                "pef": pef,
+                "ratio": ratio,
+                "diagnosis": diagnosis,
+                "timestamp": datetime.datetime.now(datetime.timezone.utc)
+            })
+            print(f"💾 Spirometry saved for user {user_id}", flush=True)
+            
+        return jsonify(result), 200
+        
+    except Exception as e:
+        print(f"❌ Spirometry Error: {e}", flush=True)
+        return jsonify({"error": str(e)}), 500
+
+# ==========================================
+# --------- NEUROLOGY API ROUTES -----------
+# ==========================================
+@app.route('/api/analyze-cognitive', methods=['POST'])
+def analyze_cognitive():
+    if db is None: return jsonify({"error": "Database unavailable"}), 503
+    data = request.json
+    user_id = str(data.get('userId', 'guest'))
+    
+    try:
+        score = int(data.get('mocaScore', 0))
+        recall = data.get('memoryRecall', True)
+        
+        status = "success"
+        recommendation = ""
+        
+        if score >= 26:
+            diagnosis = "Normal Cognitive Function"
+        else:
+            status = "warning"
+            if score >= 18:
+                diagnosis = "Mild Cognitive Impairment (MCI)"
+                recommendation = "Consider follow-up and monitoring."
+            elif score >= 10:
+                diagnosis = "Moderate Cognitive Impairment"
+                status = "danger"
+                recommendation = "Neurological consult recommended."
+            else:
+                diagnosis = "Severe Cognitive Impairment"
+                status = "danger"
+                recommendation = "Immediate neurological consult and care planning needed."
+                
+        if not recall and score >= 26:
+            diagnosis += " (Note: Delayed Recall missed)"
+            recommendation = "Monitor short-term memory over time."
+            status = "warning"
+            
+        result = {
+            "status": status,
+            "diagnosis": diagnosis,
+            "score": score,
+            "recommendation": recommendation
+        }
+        
+        # Save to DB if not guest
+        if user_id != 'guest':
+            db.neurology_history.insert_one({
+                "user_id": user_id,
+                "moca_score": score,
+                "memory_recall": recall,
+                "diagnosis": diagnosis,
+                "timestamp": datetime.datetime.now(datetime.timezone.utc)
+            })
+            print(f"💾 Cognitive test saved for user {user_id}", flush=True)
+            
+        return jsonify(result), 200
+        
+    except Exception as e:
+        print(f"❌ Cognitive Error: {e}", flush=True)
+        return jsonify({"error": str(e)}), 500
+
+# ==========================================
+# --------- PORTAL FEATURE ROUTES ----------
+# ==========================================
+
+def to_base36(n):
+    chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    res = ""
+    while n > 0:
+        n, r = divmod(n, 36)
+        res = chars[r] + res
+    return res or "0"
+
+@socketio.on('book_appointment')
+def handle_book_appointment(data):
+    if 'db' in globals() and db is not None:
+        try:
+            doctor = data.get('doctor')
+            date = data.get('date')
+            time_slot = data.get('time')
+
+            # --- 1. CONFLICT DETECTION (Mutual Exclusion) ---
+            existing = db.appointments.find_one({
+                "doctor": doctor,
+                "date": date,
+                "time": time_slot,
+                "status": {"$ne": "cancelled"}
+            })
+
+            if existing:
+                # Find available slots for suggestions
+                all_slots = ["09:00", "09:30", "10:00", "10:30", "11:00", "11:30", "12:00", "12:30", 
+                             "14:00", "14:30", "15:00", "15:30", "16:00", "16:30", "17:00"]
+                booked = db.appointments.find({
+                    "doctor": doctor,
+                    "date": date,
+                    "status": {"$ne": "cancelled"}
+                }).distinct("time")
+                
+                available = [s for s in all_slots if s not in booked]
+                
+                emit('appointment_error', {
+                    "error": "This time slot is already booked for this doctor.",
+                    "suggested": available[:5] # Suggest first 5 available
+                }, broadcast=False)
+                return
+
+            # --- 2. Sequential Token Logic ---
+            counter = db.counters.find_one_and_update(
+                {"_id": "appointment_token"},
+                {"$inc": {"sequence_value": 1}},
+                upsert=True,
+                return_document=ReturnDocument.AFTER
+            )
+            seq = counter.get("sequence_value", 1)
+            # Encode YYMMDDHHMM into Base36 for brevity
+            now_val = int(datetime.datetime.now().strftime("%y%m%d%H%M"))
+            encoded_date = to_base36(now_val)
+            token_number = f"TKN-{encoded_date}-{seq:04d}"
+            
+            # Auto-resolve patient name
+            user_id = data.get('userId')
+            patient_name = data.get('patientName')
+            if user_id != 'guest' and 'db' in globals() and db is not None:
+                from bson.objectid import ObjectId
+                try:
+                    user = db.users.find_one({"_id": ObjectId(user_id)})
+                except:
+                    user = db.users.find_one({"_id": user_id})
+                if user and user.get('role') != 'admin':
+                    patient_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
+            if not patient_name:
+                patient_name = 'Unknown Patient'
+
+            appointment_doc = {
+                "user_id": user_id,
+                "patient_name": patient_name,
+                "department": data.get('department'),
+                "doctor": data.get('doctor'),
+                "date": data.get('date'),
+                "time": data.get('time'),
+                "status": "confirmed",
+                "token_number": token_number,
+                "created_at": datetime.datetime.now(datetime.timezone.utc)
+            }
+            db.appointments.insert_one(appointment_doc)
+            emit('appointment_booked', {"status": "success", "message": "Appointment Confirmed", "token": token_number}, broadcast=False)
+            
+            user_apps = list(db.appointments.find({"user_id": data.get('userId')}, {"_id": 0}))
+            for i, app_ in enumerate(user_apps):
+                if "id" not in app_:
+                    app_["id"] = app_.get("token_number", i + 100)
+                if 'created_at' in app_ and app_['created_at']:
+                    app_['created_at'] = app_['created_at'].isoformat()
+            emit('appointment_update', user_apps, broadcast=False)
+        except Exception as e:
+            print(f"❌ Appointment Booking Error: {e}", flush=True)
+            emit('appointment_error', {"error": str(e)}, broadcast=False)
+
+@socketio.on('cancel_appointment')
+def handle_cancel_appointment(data):
+    if 'db' in globals() and db is not None:
+        try:
+            db.appointments.update_one({"token_number": data.get('id')}, {"$set": {"status": "cancelled"}})
+        except Exception as e:
+            pass
+
+@socketio.on('delete_appointment')
+def handle_delete_appointment(data):
+    if 'db' in globals() and db is not None:
+        try:
+            db.appointments.delete_one({"token_number": data.get('id')})
+        except Exception as e:
+            pass
+
+@socketio.on('get_appointments')
+def handle_get_appointments(data):
+    if 'db' in globals() and db is not None:
+        try:
+            user_id = data.get('userId')
+            role = data.get('role', 'patient')
+            
+            # Verify role from DB
+            from bson.objectid import ObjectId
+            try:
+                user = db.users.find_one({"_id": ObjectId(user_id)})
+            except:
+                user = db.users.find_one({"_id": user_id})
+                
+            if user and user.get('role') == 'admin':
+                role = 'admin'
+
+            if role == 'admin':
+                # Admins get ALL appointments
+                apps = list(db.appointments.find({}, {"_id": 0}))
+            else:
+                apps = list(db.appointments.find({"user_id": user_id}, {"_id": 0}))
+                
+            for i, app_ in enumerate(apps):
+                if "id" not in app_:
+                    app_["id"] = app_.get("token_number", i + 100)
+                # Convert datetime objects to strings
+                if 'created_at' in app_ and app_['created_at']:
+                    app_['created_at'] = app_['created_at'].isoformat()
+            emit('appointment_update', apps, broadcast=False)
+        except Exception as e:
+            print(f"❌ Get Appointments Error: {e}", flush=True)
+            emit('appointment_error', {"error": str(e)}, broadcast=False)
+
+# --- LAB REPORTS (HTTP) ---
+@app.route('/api/reports/<string:user_id>', methods=['GET'])
+def get_lab_reports(user_id):
+    mock_reports = [
+        {"date": "2026-04-15", "testName": "Complete Blood Count", "doctor": "Dr. Smith", "status": "Ready", "downloadUrl": "#"},
+        {"date": "2026-04-22", "testName": "Chest X-Ray", "doctor": "Dr. Lee", "status": "In Progress", "downloadUrl": "#"}
+    ]
+    return jsonify({"status": "success", "reports": mock_reports}), 200
+
+# --- DOCUMENTS (HTTP) ---
+from flask import send_from_directory
+
+@app.route('/api/upload_doc', methods=['POST'])
+def upload_doc():
+    if 'document' not in request.files:
+        return jsonify({"error": "No file part"}), 400
+    file = request.files['document']
+    user_id = request.form.get('userId', 'guest')
+    
+    if file.filename == '':
+        return jsonify({"error": "No selected file"}), 400
+        
+    if file:
+        filename = secure_filename(file.filename)
+        unique_filename = f"{uuid.uuid4().hex}_{filename}"
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
+        file.save(filepath)
+        
+        if 'db' in globals() and db is not None and user_id != 'guest':
+            db.user_documents.insert_one({
+                "user_id": user_id,
+                "original_filename": filename,
+                "saved_filename": unique_filename,
+                "type": "image" if filename.lower().endswith(('.png', '.jpg', '.jpeg')) else "pdf",
+                "uploaded_at": datetime.datetime.now(datetime.timezone.utc)
+            })
+            
+        return jsonify({"status": "success", "message": "File uploaded successfully"}), 200
+
+@app.route('/api/documents/<string:user_id>', methods=['GET'])
+def get_documents(user_id):
+    if 'db' in globals() and db is not None:
+        try:
+            docs = list(db.user_documents.find({"user_id": user_id}, {"_id": 0}).sort("uploaded_at", -1))
+            formatted_docs = []
+            for d in docs:
+                file_url = f"{request.host_url}uploads/{d['saved_filename']}"
+                formatted_docs.append({
+                    "filename": d['original_filename'],
+                    "type": d.get('type', 'pdf'),
+                    "date": d['uploaded_at'].strftime("%Y-%m-%d") if 'uploaded_at' in d else "Unknown",
+                    "url": file_url
+                })
+            return jsonify({"status": "success", "documents": formatted_docs}), 200
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    return jsonify({"status": "success", "documents": []}), 200
+
+@app.route('/uploads/<filename>')
+def serve_upload(filename):
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
 # Start Server
 if __name__ == '__main__':
