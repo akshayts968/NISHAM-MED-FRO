@@ -102,8 +102,8 @@ try:
     base_dir = os.path.dirname(os.path.abspath(__file__))
     
     # 2. Build the exact file paths
-    blood_scaler_path = os.path.join(base_dir, 'medical_scaler.pkl')
-    blood_model_path = os.path.join(base_dir, 'cardiology_rf_model.pkl')
+    blood_scaler_path = os.path.join(base_dir, 'scaler.pkl')
+    blood_model_path = os.path.join(base_dir, 'svm_model.pkl')
     
     # 3. Load the files using the secure paths
     blood_scaler = joblib.load(blood_scaler_path)
