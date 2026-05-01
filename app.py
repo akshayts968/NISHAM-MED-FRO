@@ -1306,7 +1306,7 @@ def serve_upload(filename):
 
 # Start Server
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 5001))
     print(f"SocketIO Server running on port {port}")
     # Change app.run to socketio.run!
     socketio.run(app, host='0.0.0.0', port=port)
